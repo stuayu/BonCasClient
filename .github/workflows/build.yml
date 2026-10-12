@@ -1,0 +1,37 @@
+name: build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        platform: [Win32, x64]
+    env:
+      _CL_: /source-charset:.932
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.platform == 'Win32' && 'x86' || 'x64' }}
+      - name: Build and run portable tests
+        shell: pwsh
+        run: |
+          cl /nologo /EHsc /std:c++17 /W4 /I Common Test\ReaderTableTest.cpp /Fe:ReaderTableTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\ReaderTableTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build DLL
+        shell: pwsh
+        run: |
+          msbuild BonCasClient.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PlatformToolset=v143
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: BonCasClient-${{ matrix.platform }}
+          path: ${{ matrix.platform == 'x64' && 'x64/Release/BonCasClient.dll' || 'Release/BonCasClient.dll' }}
+          if-no-files-found: error

@@ -29,6 +29,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\Common\ReaderTableCore.h">
+      <Filter>ヘッダー ファイル</Filter>
+    </ClInclude>
     <ClInclude Include="CasProxy.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
@@ -49,5 +52,6 @@
   </ItemGroup>
   <ItemGroup>
     <Text Include="ReadMe.txt" />
+    <None Include="..\Test\ReaderTableTest.cpp" />
   </ItemGroup>
 </Project>

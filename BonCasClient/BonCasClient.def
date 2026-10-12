@@ -19,3 +19,18 @@ EXPORTS
 	SCardListReadersW	=CasLinkListReadersW
 	SCardTransmit		=CasLinkTransmit
 	SCardReleaseContext	=CasLinkReleaseContext
+
+	SCardStatusA=CasLinkStatusA
+	SCardStatusW=CasLinkStatusW
+	SCardGetStatusChangeA=CasLinkGetStatusChangeA
+	SCardGetStatusChangeW=CasLinkGetStatusChangeW
+	SCardBeginTransaction=CasLinkBeginTransaction
+	SCardEndTransaction=CasLinkEndTransaction
+	SCardReconnect=CasLinkReconnect
+	SCardIsValidContext=CasLinkIsValidContext
+	SCardCancel=CasLinkCancel
+	SCardGetAttrib=CasLinkGetAttrib
+	SCardControl=CasLinkControl
+	g_rgSCardT0Pci DATA
+	g_rgSCardT1Pci DATA
+	g_rgSCardRawPci DATA
