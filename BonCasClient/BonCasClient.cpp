@@ -32,12 +32,19 @@ namespace {
 std::once_flag initFlag;
 std::mutex lock;
 ReaderTableCore::Config<wchar_t> config;
-struct Card { std::unique_ptr<CCasProxy> proxy; std::wstring name; };
-std::map<SCARDHANDLE, Card> cards;
+struct Card {
+    std::unique_ptr<CCasProxy> proxy;
+    std::wstring name;
+    SCARDCONTEXT context;
+    std::mutex ioLock;
+};
+std::map<SCARDHANDLE, std::shared_ptr<Card> > cards;
 std::set<SCARDCONTEXT> contexts;
-std::set<SCARDHANDLE> localCards;
-std::set<const void*> allocations;
-const SCARDCONTEXT dummyContext = static_cast<SCARDCONTEXT>(-1);
+std::set<SCARDCONTEXT> virtualContexts;
+std::set<SCARDCONTEXT> releasingContexts;
+std::map<SCARDHANDLE, SCARDCONTEXT> localCards;
+std::map<const void*, SCARDCONTEXT> allocations;
+SCARDCONTEXT nextContext = (std::numeric_limits<SCARDCONTEXT>::max)() - 1;
 SCARDHANDLE nextCard = 1;
 HMODULE systemModule = nullptr;
 HMODULE extraModule = nullptr;
@@ -67,6 +74,33 @@ decltype(&::SCardCancel) osCancel = nullptr;
 decltype(&::SCardGetAttrib) osGetAttrib = nullptr;
 decltype(&::SCardControl) osControl = nullptr;
 
+SCARDCONTEXT createVirtualContext() {
+    while (nextContext && (contexts.count(nextContext) || virtualContexts.count(nextContext) ||
+                           releasingContexts.count(nextContext))) --nextContext;
+    if (!nextContext) throw std::bad_alloc();
+    const SCARDCONTEXT context = nextContext--;
+    virtualContexts.insert(context);
+    return context;
+}
+bool validContext(SCARDCONTEXT context) {
+    return contexts.count(context) || virtualContexts.count(context);
+}
+void releaseVirtualResources(SCARDCONTEXT context) {
+    for (auto it = cards.begin(); it != cards.end();) {
+        if (it->second->context == context) it = cards.erase(it);
+        else ++it;
+    }
+    for (auto it = localCards.begin(); it != localCards.end();) {
+        if (it->second == context) it = localCards.erase(it);
+        else ++it;
+    }
+    for (auto it = allocations.begin(); it != allocations.end();) {
+        if (it->second == context) {
+            delete[] static_cast<const unsigned char*>(it->first);
+            it = allocations.erase(it);
+        } else ++it;
+    }
+}
 DWORD ipValue(const std::wstring& host) {
     unsigned long parts[4] = {};
     std::size_t start = 0;
@@ -203,7 +237,7 @@ std::string narrow(const std::wstring& s) {
     return std::string(out.data());
 }
 // Own all returned memory, including Status strings. Register before publishing.
-template<class C> LONG output(const std::basic_string<C>& data, C* dst, LPDWORD count) {
+template<class C> LONG output(const std::basic_string<C>& data, C* dst, LPDWORD count, SCARDCONTEXT context) {
     if (!count) return SCARD_E_INVALID_PARAMETER;
     DWORD needed = static_cast<DWORD>(data.size());
     DWORD capacity = *count;
@@ -212,7 +246,7 @@ template<class C> LONG output(const std::basic_string<C>& data, C* dst, LPDWORD 
     if (capacity == SCARD_AUTOALLOCATE) {
         std::unique_ptr<unsigned char[]> mem(new unsigned char[needed * sizeof(C)]);
         std::memcpy(mem.get(), data.data(), needed * sizeof(C));
-        allocations.insert(mem.get());
+        allocations.emplace(mem.get(), context);
         *reinterpret_cast<C**>(dst) = reinterpret_cast<C*>(mem.release());
         return SCARD_S_SUCCESS;
     }
@@ -222,6 +256,7 @@ template<class C> LONG output(const std::basic_string<C>& data, C* dst, LPDWORD 
 }
 template<class C, class F> LONG list(SCARDCONTEXT context, const C* groups, C* dst, LPDWORD count, F fn, F extraFn, std::unique_lock<std::mutex>& guard) {
     if (!count) return SCARD_E_INVALID_PARAMETER;
+    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
     std::vector<std::basic_string<C> > names;
     for (const auto& r : config.readers) {
         std::basic_string<C> name;
@@ -260,22 +295,25 @@ template<class C, class F> LONG list(SCARDCONTEXT context, const C* groups, C* d
         }
     }
     if (!guard.owns_lock()) guard.lock();
-    return output(ReaderTableCore::multiString(names), dst, count);
+    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+    return output(ReaderTableCore::multiString(names), dst, count, context);
 }
-LONG connectVirtual(const ReaderTableCore::Reader<wchar_t>& reader, LPSCARDHANDLE result, LPDWORD protocol) {
-    Card card;
-    card.name = reader.name;
-    card.proxy.reset(new CCasProxy(nullptr));
-    card.proxy->Setting(config.explicitReaders ? ipValue(reader.host) : g_dwIP,
-                        config.explicitReaders ? reader.port : g_wPort);
-    if (!card.proxy->Connect()) return SCARD_E_READER_UNAVAILABLE;
+LONG connectVirtual(const ReaderTableCore::Reader<wchar_t>& reader, SCARDCONTEXT context,
+    LPSCARDHANDLE result, LPDWORD protocol) {
+    std::shared_ptr<Card> card(new Card);
+    card->context = context;
+    card->name = reader.name;
+    card->proxy.reset(new CCasProxy(nullptr));
+    card->proxy->Setting(config.explicitReaders ? ipValue(reader.host) : g_dwIP,
+                         config.explicitReaders ? reader.port : g_wPort);
+    if (!card->proxy->Connect()) return SCARD_E_READER_UNAVAILABLE;
     // Tokens never expose pointers and are never reused. Avoid known OS handles.
     if (nextCard == 0 || nextCard == (std::numeric_limits<SCARDHANDLE>::max)()) return SCARD_E_NO_MEMORY;
     while (localCards.count(nextCard)) {
         if (++nextCard == 0 || nextCard == (std::numeric_limits<SCARDHANDLE>::max)()) return SCARD_E_NO_MEMORY;
     }
     SCARDHANDLE handle = nextCard++;
-    cards.emplace(handle, std::move(card));
+    cards.emplace(handle, card);
     *result = handle;
     if (protocol) *protocol = SCARD_PROTOCOL_T1;
     return SCARD_S_SUCCESS;
@@ -284,24 +322,34 @@ template<class C, class F> LONG connect(SCARDCONTEXT context, const C* name, con
     DWORD share, DWORD protocols, LPSCARDHANDLE result, LPDWORD active, F fn, std::unique_lock<std::mutex>& guard) {
     if (!result) return SCARD_E_INVALID_PARAMETER;
     *result = 0;
+    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
     auto r = ReaderTableCore::find(config, name ? wname.c_str() : nullptr);
-    if (r) return connectVirtual(*r, result, active);
+    if (r) return connectVirtual(*r, context, result, active);
     if (name && fn && contexts.count(context)) {
         guard.unlock();
         LONG rc = fn(context, name, share, protocols, result, active);
         guard.lock();
+        if (!validContext(context)) {
+            if (rc == SCARD_S_SUCCESS) {
+                guard.unlock();
+                osDisconnect(*result, SCARD_LEAVE_CARD);
+                guard.lock();
+            }
+            *result = 0;
+            return SCARD_E_INVALID_HANDLE;
+        }
         if (rc == SCARD_S_SUCCESS) {
-            if (cards.count(*result)) {
+            if (cards.count(*result) || localCards.count(*result)) {
                 osDisconnect(*result, SCARD_LEAVE_CARD); *result = 0;
                 return SCARD_F_INTERNAL_ERROR;
             }
-            try { localCards.insert(*result); }
+            try { localCards.emplace(*result, context); }
             catch (...) { osDisconnect(*result, SCARD_LEAVE_CARD); *result = 0; throw; }
             return rc;
         }
         if (config.explicitReaders) return rc;
     }
-    if (!config.explicitReaders) return connectVirtual(config.readers.front(), result, active);
+    if (!config.explicitReaders) return connectVirtual(config.readers.front(), context, result, active);
     return SCARD_E_UNKNOWN_READER;
 }
 template<class C, class F> LONG status(SCARDHANDLE handle, C* name, LPDWORD length, LPDWORD state,
@@ -313,11 +361,13 @@ template<class C, class F> LONG status(SCARDHANDLE handle, C* name, LPDWORD leng
     if (atr && *atrLength == SCARD_AUTOALLOCATE) *reinterpret_cast<LPBYTE*>(atr) = nullptr;
     *atrLength = 0;
     std::basic_string<C> text;
-    if (sizeof(C) == sizeof(wchar_t)) text.assign(it->second.name.begin(), it->second.name.end());
-    else { auto a = narrow(it->second.name); text.assign(a.begin(), a.end()); }
-    return output(ReaderTableCore::multiString(std::vector<std::basic_string<C> >(1,text)), name, length);
+    if (sizeof(C) == sizeof(wchar_t)) text.assign(it->second->name.begin(), it->second->name.end());
+    else { auto a = narrow(it->second->name); text.assign(a.begin(), a.end()); }
+    return output(ReaderTableCore::multiString(std::vector<std::basic_string<C> >(1,text)), name, length,
+                  it->second->context);
 }
 template<class S, class F> LONG change(SCARDCONTEXT context, DWORD timeout, S* states, DWORD count, F fn, std::unique_lock<std::mutex>& guard) {
+    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
     if (count && !states) return SCARD_E_INVALID_PARAMETER;
     std::vector<S> local;
     std::vector<DWORD> indices;
@@ -338,6 +388,8 @@ template<class S, class F> LONG change(SCARDCONTEXT context, DWORD timeout, S* s
         // Do not hold the registry lock during OS waits: Cancel must be callable.
         guard.unlock();
         LONG rc = fn(context, changed ? 0 : timeout, local.data(), static_cast<DWORD>(local.size()));
+        guard.lock();
+        if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
         if (rc != SCARD_S_SUCCESS && rc != SCARD_E_TIMEOUT) return rc;
         for (std::size_t i = 0; i < local.size(); ++i) states[indices[i]] = local[i];
         return changed && rc == SCARD_E_TIMEOUT ? SCARD_S_SUCCESS : rc;
@@ -356,13 +408,19 @@ extern "C" __declspec(dllexport) BOOL WINAPI SetConfig(DWORD ip, WORD port) {
 API CasLinkEstablishContext(DWORD scope, LPCVOID a, LPCVOID b, LPSCARDCONTEXT result) {
     ENTER
     if (!result) return SCARD_E_INVALID_PARAMETER;
-    *result = dummyContext;
+    *result = 0;
     if (osEstablishContext) {
         SCARDCONTEXT context = 0;
         guard.unlock();
         LONG rc = osEstablishContext(scope,a,b,&context);
         guard.lock();
         if (rc == SCARD_S_SUCCESS) {
+            if (virtualContexts.count(context) || contexts.count(context) || releasingContexts.count(context)) {
+                guard.unlock();
+                osReleaseContext(context);
+                guard.lock();
+                return SCARD_F_INTERNAL_ERROR;
+            }
             SCARDCONTEXT extraContext = 0;
             if (extraEstablishContext && extraEstablishContext(scope,a,b,&extraContext) == SCARD_S_SUCCESS) {
                 try { extraContexts[context] = extraContext; }
@@ -376,32 +434,51 @@ API CasLinkEstablishContext(DWORD scope, LPCVOID a, LPCVOID b, LPSCARDCONTEXT re
                 throw;
             }
             *result = context;
+            return SCARD_S_SUCCESS;
         }
     }
+    *result = createVirtualContext();
     return SCARD_S_SUCCESS;
     LEAVE
 }
 API CasLinkReleaseContext(SCARDCONTEXT context) {
     ENTER
+    if (virtualContexts.erase(context)) {
+        releaseVirtualResources(context);
+        return SCARD_S_SUCCESS;
+    }
     if (contexts.count(context)) {
-        auto extra = extraContexts.find(context);
-        if (extra != extraContexts.end()) {
-            extraReleaseContext(extra->second);
-            extraContexts.erase(extra);
-        }
+        try { releasingContexts.insert(context); }
+        catch (...) { return SCARD_E_NO_MEMORY; }
+        contexts.erase(context);
         guard.unlock();
         LONG rc = osReleaseContext(context);
         guard.lock();
-        if (rc == SCARD_S_SUCCESS) contexts.erase(context);
+        releasingContexts.erase(context);
+        if (rc == SCARD_S_SUCCESS) {
+            auto extra = extraContexts.find(context);
+            SCARDCONTEXT extraContext = extra == extraContexts.end() ? 0 : extra->second;
+            if (extra != extraContexts.end()) extraContexts.erase(extra);
+            contexts.erase(context);
+            releaseVirtualResources(context);
+            if (extraContext) {
+                guard.unlock();
+                extraReleaseContext(extraContext);
+                guard.lock();
+            }
+        } else {
+            contexts.insert(context);
+        }
         return rc;
     }
-    return context == dummyContext ? SCARD_S_SUCCESS : SCARD_E_INVALID_HANDLE;
+    return SCARD_E_INVALID_HANDLE;
     LEAVE
 }
 API CasLinkFreeMemory(SCARDCONTEXT context, LPCVOID memory) {
     ENTER
     auto it = allocations.find(memory);
     if (it != allocations.end()) {
+        if (it->second != context) return SCARD_E_INVALID_PARAMETER;
         // All allocations use byte storage (see output).
         delete[] static_cast<const unsigned char*>(memory);
         allocations.erase(it); return SCARD_S_SUCCESS;
@@ -440,8 +517,11 @@ API CasLinkTransmit(SCARDHANDLE handle, LPCSCARD_IO_REQUEST sendPci, LPCBYTE sen
     if (it == cards.end()) return osTransmit ? (guard.unlock(), osTransmit(handle,sendPci,send,sendLength,recvPci,recv,recvLength)) : SCARD_E_INVALID_HANDLE;
     if (!send || !recvLength || !recv || !sendLength || sendLength > 255) return SCARD_E_INVALID_PARAMETER;
     if (recvPci && recvPci->cbPciLength < sizeof(SCARD_IO_REQUEST)) return SCARD_E_INSUFFICIENT_BUFFER;
+    std::shared_ptr<Card> card = it->second;
     BYTE response[255];
-    DWORD n = it->second.proxy->TransmitCommand(send,sendLength,response);
+    guard.unlock();
+    std::lock_guard<std::mutex> io(card->ioLock);
+    DWORD n = card->proxy->TransmitCommand(send,sendLength,response);
     if (!n) { *recvLength = 0; return SCARD_E_TIMEOUT; }
     DWORD capacity = *recvLength; *recvLength = n;
     if (capacity < n) return SCARD_E_INSUFFICIENT_BUFFER;
@@ -478,13 +558,15 @@ API CasLinkReconnect(SCARDHANDLE handle, DWORD share, DWORD protocols, DWORD ini
 }
 API CasLinkIsValidContext(SCARDCONTEXT context) {
     ENTER
-    if (context == dummyContext) return SCARD_S_SUCCESS;
+    if (virtualContexts.count(context)) return SCARD_S_SUCCESS;
+    if (!contexts.count(context)) return SCARD_E_INVALID_HANDLE;
     return osIsValidContext ? (guard.unlock(), osIsValidContext(context)) : SCARD_E_INVALID_HANDLE;
     LEAVE
 }
 API CasLinkCancel(SCARDCONTEXT context) {
     ENTER
-    if (context == dummyContext) return SCARD_S_SUCCESS;
+    if (virtualContexts.count(context)) return SCARD_S_SUCCESS;
+    if (!contexts.count(context)) return SCARD_E_INVALID_HANDLE;
     return osCancel ? (guard.unlock(), osCancel(context)) : SCARD_E_INVALID_HANDLE;
     LEAVE
 }

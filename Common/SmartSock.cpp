@@ -104,10 +104,13 @@ const BOOL CSmartSock::Connect(const DWORD dwIP, const WORD wPort, const DWORD d
 	u_long nArg = 1UL;
 	fd_set FdSet;
 	struct timeval TimeVal;
-	TimeVal.tv_sec = 0UL;
-	TimeVal.tv_usec = dwTimeOut * 1000UL;
+	TimeVal.tv_sec = static_cast<long>(dwTimeOut / 1000UL);
+	TimeVal.tv_usec = static_cast<long>((dwTimeOut % 1000UL) * 1000UL);
+	fd_set ExceptSet;
 	FD_ZERO(&FdSet);
+	FD_ZERO(&ExceptSet);
 	FD_SET(m_Socket, &FdSet);
+	FD_SET(m_Socket, &ExceptSet);
 
 	try{
 		// 非同期に切り替え
@@ -119,13 +122,23 @@ const BOOL CSmartSock::Connect(const DWORD dwIP, const WORD wPort, const DWORD d
 		if(::WSAGetLastError() != WSAEWOULDBLOCK)throw (const DWORD)__LINE__;
 
 		// 接続完了待ち
-		if(!::select(32, NULL, &FdSet, NULL, &TimeVal))throw (const DWORD)__LINE__;
-
-		// タイムアウト判定
-		if(!FD_ISSET(m_Socket, &FdSet)){
+		const int iSelect = ::select(0, NULL, &FdSet, &ExceptSet, &TimeVal);
+		if(iSelect == SOCKET_ERROR)throw (const DWORD)__LINE__;
+		if(!iSelect){
 			Close();
 			m_dwLastError = EC_TIMEOUT;
 			return FALSE;
+			}
+
+		// タイムアウト判定
+		if(!FD_ISSET(m_Socket, &FdSet) && !FD_ISSET(m_Socket, &ExceptSet)){
+			Close();
+			m_dwLastError = EC_TIMEOUT;
+			return FALSE;
+			}
+		int iConnectError = 0, iConnectErrorSize = sizeof(iConnectError);
+		if(::getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, (char *)&iConnectError, &iConnectErrorSize) || iConnectError){
+			throw (const DWORD)__LINE__;
 			}
 
 		// 同期に切り替え
@@ -257,16 +270,17 @@ const DWORD CSmartSock::SendOnce(const BYTE *pBuff, const DWORD dwMaxLen, const 
 		}
 	
 	// タイムアウト設定
-	int iValue  = 0, iSize = sizeof(int);
+	DWORD dwValue = 0;
+	int iSize = sizeof(dwValue);
 
-	if(::getsockopt(m_Socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&iValue, &iSize)){
+	if(::getsockopt(m_Socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&dwValue, &iSize)){
 		Close();
 		m_dwLastError = EC_SOCKERROR;
 		return 0UL;
 		}
 	
-	if(iValue != (int)dwTimeOut){
-		if(::setsockopt(m_Socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&iValue, sizeof(int))){
+	if(dwValue != dwTimeOut){
+		if(::setsockopt(m_Socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&dwTimeOut, sizeof(dwTimeOut))){
 			Close();
 			m_dwLastError = EC_SOCKERROR;
 			return 0UL;
@@ -303,16 +317,17 @@ const DWORD CSmartSock::RecvOnce(BYTE *pBuff, const DWORD dwMaxLen, const DWORD 
 		}
 
 	// タイムアウト値設定
-	int iValue  = 0, iSize = sizeof(int);
+	DWORD dwValue = 0;
+	int iSize = sizeof(dwValue);
 
-	if(::getsockopt(m_Socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&iValue, &iSize)){
+	if(::getsockopt(m_Socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&dwValue, &iSize)){
 		Close();
 		m_dwLastError = EC_SOCKERROR;
 		return 0UL;
 		}
 
-	if(iValue != (int)dwTimeOut){
-		if(::setsockopt(m_Socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&iValue, sizeof(int))){
+	if(dwValue != dwTimeOut){
+		if(::setsockopt(m_Socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&dwTimeOut, sizeof(dwTimeOut))){
 			Close();
 			m_dwLastError = EC_SOCKERROR;
 			return 0UL;
@@ -494,7 +509,7 @@ const BOOL CSmartSock::Close()
 {
 	// ソケットクローズ
 	if(m_Socket != INVALID_SOCKET){
-		if(m_bSockType = SOCKTYPE_TCP){
+		if(m_bSockType == SOCKTYPE_TCP){
 			char byData;
 			::shutdown(m_Socket, SD_BOTH);
 			while(::recv(m_Socket, &byData, 1, 0) == 1);
