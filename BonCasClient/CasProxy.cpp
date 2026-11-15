@@ -5,13 +5,19 @@
 
 #include "StdAfx.h"
 #include "CasProxy.h"
+#include <map>
+#include <mutex>
+#include <utility>
 
 
 #define WM_BONCASPROXY_EVENT		(WM_USER + 100U)
 #define TCP_TIMEOUT					1000UL				// 1秒
 
 
-DWORD CCasProxy::dwErrorDelayTime = 0UL;
+namespace {
+std::mutex connectBackoffLock;
+std::map<std::pair<DWORD, WORD>, DWORD> connectErrorTimes;
+}
 
 
 CCasProxy::CCasProxy(const HWND hProxyHwnd)
@@ -36,23 +42,27 @@ const void CCasProxy::Setting(const DWORD dwIP, const WORD wPort)
 
 const BOOL CCasProxy::Connect(void)
 {
-	// エラー発生時のガードインターバル
-	if(dwErrorDelayTime){
-		if((::GetTickCount() - dwErrorDelayTime) < TCP_TIMEOUT)return FALSE;
-		else dwErrorDelayTime = 0UL;
+	const std::pair<DWORD, WORD> endpoint(m_dwIP, m_wPort);
+	{
+		std::lock_guard<std::mutex> guard(connectBackoffLock);
+		const DWORD now = ::GetTickCount();
+		for (auto it = connectErrorTimes.begin(); it != connectErrorTimes.end();) {
+			if (now - it->second >= TCP_TIMEOUT) it = connectErrorTimes.erase(it);
+			else ++it;
+			}
+		if (connectErrorTimes.count(endpoint)) return FALSE;
 		}
 
-	// サーバに接続
-	//if(m_Socket.Connect(SendProxyEvent(CPEI_GETSERVERIP), (WORD)SendProxyEvent(CPEI_GETSERVERPORT), TCP_TIMEOUT)){
-	if(m_Socket.Connect(m_dwIP, m_wPort, TCP_TIMEOUT)){
-//		SendProxyEvent(CPEI_CONNECTSUCCESS);
+	if (m_Socket.Connect(m_dwIP, m_wPort, TCP_TIMEOUT)) {
+		std::lock_guard<std::mutex> guard(connectBackoffLock);
+		connectErrorTimes.erase(endpoint);
 		return TRUE;
 		}
-	else{
-		dwErrorDelayTime = ::GetTickCount();
-//		SendProxyEvent(CPEI_CONNECTFAILED);
-		return FALSE;
+	{
+		std::lock_guard<std::mutex> guard(connectBackoffLock);
+		connectErrorTimes[endpoint] = ::GetTickCount();
 		}
+	return FALSE;
 }
 
 const DWORD CCasProxy::TransmitCommand(const BYTE *pSendData, const DWORD dwSendSize, BYTE *pRecvData)
