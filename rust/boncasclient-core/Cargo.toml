@@ -1,0 +1,11 @@
+[package]
+name = "boncasclient-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+encoding_rs = "0.8"
