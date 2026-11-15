@@ -117,28 +117,27 @@ const BOOL CSmartSock::Connect(const DWORD dwIP, const WORD wPort, const DWORD d
 		if(::ioctlsocket(m_Socket, FIONBIO, &nArg) == SOCKET_ERROR)throw (const DWORD)__LINE__;
 
 		// コネクト
-		if(::connect(m_Socket, (PSOCKADDR)&SockAddr, sizeof(sockaddr)) != SOCKET_ERROR)throw (const DWORD)__LINE__;
+		if(::connect(m_Socket, (PSOCKADDR)&SockAddr, sizeof(sockaddr)) == SOCKET_ERROR){
+			if(::WSAGetLastError() != WSAEWOULDBLOCK)throw (const DWORD)__LINE__;
 
-		if(::WSAGetLastError() != WSAEWOULDBLOCK)throw (const DWORD)__LINE__;
+			// Wait only when the nonblocking connect is still in progress.
+			const int iSelect = ::select(0, NULL, &FdSet, &ExceptSet, &TimeVal);
+			if(iSelect == SOCKET_ERROR)throw (const DWORD)__LINE__;
+			if(!iSelect){
+				Close();
+				m_dwLastError = EC_TIMEOUT;
+				return FALSE;
+				}
 
-		// 接続完了待ち
-		const int iSelect = ::select(0, NULL, &FdSet, &ExceptSet, &TimeVal);
-		if(iSelect == SOCKET_ERROR)throw (const DWORD)__LINE__;
-		if(!iSelect){
-			Close();
-			m_dwLastError = EC_TIMEOUT;
-			return FALSE;
-			}
-
-		// タイムアウト判定
-		if(!FD_ISSET(m_Socket, &FdSet) && !FD_ISSET(m_Socket, &ExceptSet)){
-			Close();
-			m_dwLastError = EC_TIMEOUT;
-			return FALSE;
-			}
-		int iConnectError = 0, iConnectErrorSize = sizeof(iConnectError);
-		if(::getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, (char *)&iConnectError, &iConnectErrorSize) || iConnectError){
-			throw (const DWORD)__LINE__;
+			if(!FD_ISSET(m_Socket, &FdSet) && !FD_ISSET(m_Socket, &ExceptSet)){
+				Close();
+				m_dwLastError = EC_TIMEOUT;
+				return FALSE;
+				}
+			int iConnectError = 0, iConnectErrorSize = sizeof(iConnectError);
+			if(::getsockopt(m_Socket, SOL_SOCKET, SO_ERROR, (char *)&iConnectError, &iConnectErrorSize) || iConnectError){
+				throw (const DWORD)__LINE__;
+				}
 			}
 
 		// 同期に切り替え
