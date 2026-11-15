@@ -9,12 +9,15 @@
 #undef g_rgSCardRawPci
 #include "CasProxy.h"
 #include "../Common/ReaderTableCore.h"
+#include <condition_variable>
 #include <mutex>
 #include <map>
 #include <set>
 #include <memory>
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
+#include <chrono>
 #include <cwchar>
 #include <limits>
 #include <utility>
@@ -31,7 +34,14 @@ WORD g_wPort = 6900;
 namespace {
 std::once_flag initFlag;
 std::mutex lock;
+std::condition_variable contextReleaseChanged;
+std::condition_variable extraReaderCallChanged;
+std::condition_variable statusChangeFinished;
+std::condition_variable localCardReleaseChanged;
 ReaderTableCore::Config<wchar_t> config;
+struct ContextIdentity {};
+using ContextIdentityPtr = std::shared_ptr<const ContextIdentity>;
+std::map<SCARDCONTEXT, ContextIdentityPtr> contextIdentities;
 struct Card {
     std::unique_ptr<CCasProxy> proxy;
     std::wstring name;
@@ -42,7 +52,13 @@ std::map<SCARDHANDLE, std::shared_ptr<Card> > cards;
 std::set<SCARDCONTEXT> contexts;
 std::set<SCARDCONTEXT> virtualContexts;
 std::set<SCARDCONTEXT> releasingContexts;
+std::map<SCARDCONTEXT, std::size_t> activeExtraReaderCalls;
+std::map<SCARDCONTEXT, std::size_t> activeStatusChanges;
+std::set<SCARDHANDLE> releasingLocalCards;
 std::map<SCARDHANDLE, SCARDCONTEXT> localCards;
+struct LocalCardIdentity {};
+using LocalCardIdentityPtr = std::shared_ptr<const LocalCardIdentity>;
+std::map<SCARDHANDLE, LocalCardIdentityPtr> localCardIdentities;
 std::map<const void*, SCARDCONTEXT> allocations;
 SCARDCONTEXT nextContext = (std::numeric_limits<SCARDCONTEXT>::max)() - 1;
 SCARDHANDLE nextCard = 1;
@@ -80,18 +96,115 @@ SCARDCONTEXT createVirtualContext() {
     if (!nextContext) throw std::bad_alloc();
     const SCARDCONTEXT context = nextContext--;
     virtualContexts.insert(context);
+    try {
+        contextIdentities.emplace(context, ContextIdentityPtr(new ContextIdentity));
+    } catch (...) {
+        virtualContexts.erase(context);
+        throw;
+    }
     return context;
 }
 bool validContext(SCARDCONTEXT context) {
-    return contexts.count(context) || virtualContexts.count(context);
+    return virtualContexts.count(context) || (contexts.count(context) && !releasingContexts.count(context));
+}
+ContextIdentityPtr contextIdentity(SCARDCONTEXT context) {
+    auto it = contextIdentities.find(context);
+    return it == contextIdentities.end() ? ContextIdentityPtr() : it->second;
+}
+bool sameContext(SCARDCONTEXT context, const ContextIdentityPtr& identity) {
+    auto it = contextIdentities.find(context);
+    return validContext(context) && identity && it != contextIdentities.end() && it->second == identity;
+}
+bool settledContext(SCARDCONTEXT context, const ContextIdentityPtr& identity,
+    std::unique_lock<std::mutex>& guard) {
+    while (releasingContexts.count(context) && contextIdentity(context) == identity)
+        contextReleaseChanged.wait(guard);
+    return sameContext(context, identity);
+}
+void waitForLocalCardRelease(SCARDHANDLE handle, std::unique_lock<std::mutex>& guard) {
+    while (releasingLocalCards.count(handle)) localCardReleaseChanged.wait(guard);
+}
+void finishExtraReaderCall(SCARDCONTEXT context) {
+    auto it = activeExtraReaderCalls.find(context);
+    if (it != activeExtraReaderCalls.end() && --it->second == 0) activeExtraReaderCalls.erase(it);
+    extraReaderCallChanged.notify_all();
+}
+class ExtraReaderCall {
+public:
+    ExtraReaderCall(SCARDCONTEXT context, std::unique_lock<std::mutex>& guard)
+        : context_(context), guard_(guard), active_(true) {
+        ++activeExtraReaderCalls[context_];
+    }
+    ~ExtraReaderCall() { finish(); }
+    void finish() {
+        if (!active_) return;
+        if (!guard_.owns_lock()) guard_.lock();
+        finishExtraReaderCall(context_);
+        active_ = false;
+    }
+private:
+    SCARDCONTEXT context_;
+    std::unique_lock<std::mutex>& guard_;
+    bool active_;
+};
+void finishStatusChange(SCARDCONTEXT context) {
+    auto it = activeStatusChanges.find(context);
+    if (it != activeStatusChanges.end() && --it->second == 0) activeStatusChanges.erase(it);
+    statusChangeFinished.notify_all();
+}
+class StatusChangeCall {
+public:
+    StatusChangeCall(SCARDCONTEXT context, std::unique_lock<std::mutex>& guard)
+        : context_(context), guard_(guard), active_(true) {
+        ++activeStatusChanges[context_];
+    }
+    ~StatusChangeCall() { finish(); }
+    void finish() {
+        if (!active_) return;
+        if (!guard_.owns_lock()) guard_.lock();
+        finishStatusChange(context_);
+        active_ = false;
+    }
+private:
+    SCARDCONTEXT context_;
+    std::unique_lock<std::mutex>& guard_;
+    bool active_;
+};
+bool waitForLocalCardContext(SCARDHANDLE handle, std::unique_lock<std::mutex>& guard) {
+    auto it = localCards.find(handle);
+    if (it == localCards.end()) return true;
+    const SCARDCONTEXT context = it->second;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity) return false;
+    while (releasingContexts.count(context) && contextIdentity(context) == identity)
+        contextReleaseChanged.wait(guard);
+    it = localCards.find(handle);
+    if (it == localCards.end() || it->second != context || !sameContext(context, identity)) return false;
+    return true;
+}
+void waitForLocalCardHandleRelease(SCARDHANDLE handle, std::unique_lock<std::mutex>& guard) {
+    for (;;) {
+        waitForLocalCardRelease(handle, guard);
+        auto it = localCards.find(handle);
+        if (it == localCards.end()) return;
+        const SCARDCONTEXT context = it->second;
+        const ContextIdentityPtr identity = contextIdentity(context);
+        if (!identity) return;
+        if (!releasingContexts.count(context) || contextIdentity(context) != identity) return;
+        contextReleaseChanged.wait(guard);
+    }
 }
 void releaseVirtualResources(SCARDCONTEXT context) {
+    contextIdentities.erase(context);
     for (auto it = cards.begin(); it != cards.end();) {
         if (it->second->context == context) it = cards.erase(it);
         else ++it;
     }
     for (auto it = localCards.begin(); it != localCards.end();) {
-        if (it->second == context) it = localCards.erase(it);
+        if (it->second == context) {
+            localCardIdentities.erase(it->first);
+            it = localCards.erase(it);
+        }
         else ++it;
     }
     for (auto it = allocations.begin(); it != allocations.end();) {
@@ -256,7 +369,8 @@ template<class C> LONG output(const std::basic_string<C>& data, C* dst, LPDWORD 
 }
 template<class C, class F> LONG list(SCARDCONTEXT context, const C* groups, C* dst, LPDWORD count, F fn, F extraFn, std::unique_lock<std::mutex>& guard) {
     if (!count) return SCARD_E_INVALID_PARAMETER;
-    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity || !settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
     std::vector<std::basic_string<C> > names;
     for (const auto& r : config.readers) {
         std::basic_string<C> name;
@@ -268,6 +382,8 @@ template<class C, class F> LONG list(SCARDCONTEXT context, const C* groups, C* d
         auto extraIt = extraContexts.find(context);
         const bool hasExtraContext = extraIt != extraContexts.end();
         const SCARDCONTEXT extraContext = hasExtraContext ? extraIt->second : 0;
+        std::unique_ptr<ExtraReaderCall> extraOperation;
+        if (hasExtraContext && extraFn) extraOperation.reset(new ExtraReaderCall(context, guard));
         guard.unlock();
         F sources[2] = {fn, extraFn};
         for (int source = 0; source < 2; ++source) {
@@ -293,20 +409,34 @@ template<class C, class F> LONG list(SCARDCONTEXT context, const C* groups, C* d
                 }
             }
         }
+        if (!guard.owns_lock()) guard.lock();
+        if (extraOperation) extraOperation->finish();
     }
     if (!guard.owns_lock()) guard.lock();
-    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+    if (!settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
     return output(ReaderTableCore::multiString(names), dst, count, context);
 }
 LONG connectVirtual(const ReaderTableCore::Reader<wchar_t>& reader, SCARDCONTEXT context,
-    LPSCARDHANDLE result, LPDWORD protocol) {
+    LPSCARDHANDLE result, LPDWORD protocol, std::unique_lock<std::mutex>& guard,
+    const ContextIdentityPtr& identity) {
     std::shared_ptr<Card> card(new Card);
     card->context = context;
     card->name = reader.name;
     card->proxy.reset(new CCasProxy(nullptr));
-    card->proxy->Setting(config.explicitReaders ? ipValue(reader.host) : g_dwIP,
-                         config.explicitReaders ? reader.port : g_wPort);
-    if (!card->proxy->Connect()) return SCARD_E_READER_UNAVAILABLE;
+    const DWORD ip = config.explicitReaders ? ipValue(reader.host) : g_dwIP;
+    const WORD port = config.explicitReaders ? reader.port : g_wPort;
+    card->proxy->Setting(ip, port);
+    guard.unlock();
+    BOOL connected = FALSE;
+    try {
+        connected = card->proxy->Connect();
+    } catch (...) {
+        guard.lock();
+        throw;
+    }
+    guard.lock();
+    if (!settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
+    if (!connected) return SCARD_E_READER_UNAVAILABLE;
     // Tokens never expose pointers and are never reused. Avoid known OS handles.
     if (nextCard == 0 || nextCard == (std::numeric_limits<SCARDHANDLE>::max)()) return SCARD_E_NO_MEMORY;
     while (localCards.count(nextCard)) {
@@ -322,40 +452,59 @@ template<class C, class F> LONG connect(SCARDCONTEXT context, const C* name, con
     DWORD share, DWORD protocols, LPSCARDHANDLE result, LPDWORD active, F fn, std::unique_lock<std::mutex>& guard) {
     if (!result) return SCARD_E_INVALID_PARAMETER;
     *result = 0;
-    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity || !settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
     auto r = ReaderTableCore::find(config, name ? wname.c_str() : nullptr);
-    if (r) return connectVirtual(*r, context, result, active);
+    if (r) return connectVirtual(*r, context, result, active, guard, identity);
     if (name && fn && contexts.count(context)) {
         guard.unlock();
         LONG rc = fn(context, name, share, protocols, result, active);
         guard.lock();
-        if (!validContext(context)) {
-            if (rc == SCARD_S_SUCCESS) {
-                guard.unlock();
-                osDisconnect(*result, SCARD_LEAVE_CARD);
-                guard.lock();
-            }
+        if (rc == SCARD_S_SUCCESS) waitForLocalCardHandleRelease(*result, guard);
+        if (!settledContext(context, identity, guard)) {
             *result = 0;
             return SCARD_E_INVALID_HANDLE;
         }
         if (rc == SCARD_S_SUCCESS) {
             if (cards.count(*result) || localCards.count(*result)) {
-                osDisconnect(*result, SCARD_LEAVE_CARD); *result = 0;
+                guard.unlock();
+                osDisconnect(*result, SCARD_LEAVE_CARD);
+                guard.lock();
+                *result = 0;
                 return SCARD_F_INTERNAL_ERROR;
             }
-            try { localCards.emplace(*result, context); }
-            catch (...) { osDisconnect(*result, SCARD_LEAVE_CARD); *result = 0; throw; }
+            try {
+                if (!localCards.emplace(*result, context).second ||
+                    !localCardIdentities.emplace(*result, LocalCardIdentityPtr(new LocalCardIdentity)).second)
+                    throw std::bad_alloc();
+            }
+            catch (...) {
+                localCards.erase(*result);
+                localCardIdentities.erase(*result);
+                guard.unlock();
+                osDisconnect(*result, SCARD_LEAVE_CARD);
+                guard.lock();
+                *result = 0;
+                throw;
+            }
             return rc;
         }
         if (config.explicitReaders) return rc;
     }
-    if (!config.explicitReaders) return connectVirtual(config.readers.front(), context, result, active);
+    if (!config.explicitReaders) return connectVirtual(config.readers.front(), context, result, active, guard, identity);
     return SCARD_E_UNKNOWN_READER;
 }
 template<class C, class F> LONG status(SCARDHANDLE handle, C* name, LPDWORD length, LPDWORD state,
     LPDWORD protocol, LPBYTE atr, LPDWORD atrLength, F fn, std::unique_lock<std::mutex>& guard) {
     auto it = cards.find(handle);
-    if (it == cards.end()) return fn ? (guard.unlock(), fn(handle,name,length,state,protocol,atr,atrLength)) : SCARD_E_INVALID_HANDLE;
+    if (it == cards.end()) {
+        if (!fn) return SCARD_E_INVALID_HANDLE;
+        if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+        guard.unlock();
+        LONG rc = fn(handle,name,length,state,protocol,atr,atrLength);
+        guard.lock();
+        return rc;
+    }
     if (!length || !state || !protocol || !atrLength) return SCARD_E_INVALID_PARAMETER;
     *state = SCARD_SPECIFIC; *protocol = SCARD_PROTOCOL_T1;
     if (atr && *atrLength == SCARD_AUTOALLOCATE) *reinterpret_cast<LPBYTE*>(atr) = nullptr;
@@ -367,8 +516,11 @@ template<class C, class F> LONG status(SCARDHANDLE handle, C* name, LPDWORD leng
                   it->second->context);
 }
 template<class S, class F> LONG change(SCARDCONTEXT context, DWORD timeout, S* states, DWORD count, F fn, std::unique_lock<std::mutex>& guard) {
-    if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity || !settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
     if (count && !states) return SCARD_E_INVALID_PARAMETER;
+    std::vector<S> resultStates;
+    if (count) resultStates.assign(states, states + count);
     std::vector<S> local;
     std::vector<DWORD> indices;
     bool changed = false;
@@ -376,24 +528,38 @@ template<class S, class F> LONG change(SCARDCONTEXT context, DWORD timeout, S* s
         if (!states[i].szReader) return SCARD_E_INVALID_PARAMETER;
         std::wstring name = wide(states[i].szReader);
         if (ReaderTableCore::find(config, name.c_str())) {
-            if (states[i].dwCurrentState & SCARD_STATE_IGNORE) { states[i].dwEventState = SCARD_STATE_IGNORE; continue; }
+            if (resultStates[i].dwCurrentState & SCARD_STATE_IGNORE) {
+                resultStates[i].dwEventState = SCARD_STATE_IGNORE;
+                continue;
+            }
             DWORD event = SCARD_STATE_PRESENT;
-            if ((states[i].dwCurrentState & ~SCARD_STATE_CHANGED) != event) { event |= SCARD_STATE_CHANGED; changed = true; }
-            states[i].dwEventState = event; states[i].cbAtr = 0;
-            ZeroMemory(states[i].rgbAtr, sizeof(states[i].rgbAtr));
-        } else { local.push_back(states[i]); indices.push_back(i); }
+            if ((resultStates[i].dwCurrentState & ~SCARD_STATE_CHANGED) != event) {
+                event |= SCARD_STATE_CHANGED;
+                changed = true;
+            }
+            resultStates[i].dwEventState = event;
+            resultStates[i].cbAtr = 0;
+            ZeroMemory(resultStates[i].rgbAtr, sizeof(resultStates[i].rgbAtr));
+        } else {
+            local.push_back(resultStates[i]);
+            indices.push_back(i);
+        }
     }
     if (!local.empty()) {
         if (!fn || !contexts.count(context)) return SCARD_E_UNKNOWN_READER;
         // Do not hold the registry lock during OS waits: Cancel must be callable.
+        StatusChangeCall statusChange(context, guard);
         guard.unlock();
         LONG rc = fn(context, changed ? 0 : timeout, local.data(), static_cast<DWORD>(local.size()));
         guard.lock();
-        if (!validContext(context)) return SCARD_E_INVALID_HANDLE;
+        statusChange.finish();
         if (rc != SCARD_S_SUCCESS && rc != SCARD_E_TIMEOUT) return rc;
-        for (std::size_t i = 0; i < local.size(); ++i) states[indices[i]] = local[i];
+        if (!settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
+        for (std::size_t i = 0; i < local.size(); ++i) resultStates[indices[i]] = local[i];
+        std::copy(resultStates.begin(), resultStates.end(), states);
         return changed && rc == SCARD_E_TIMEOUT ? SCARD_S_SUCCESS : rc;
     }
+    if (count) std::copy(resultStates.begin(), resultStates.end(), states);
     return changed || !count ? SCARD_S_SUCCESS : SCARD_E_TIMEOUT;
 }
 }
@@ -415,7 +581,9 @@ API CasLinkEstablishContext(DWORD scope, LPCVOID a, LPCVOID b, LPSCARDCONTEXT re
         LONG rc = osEstablishContext(scope,a,b,&context);
         guard.lock();
         if (rc == SCARD_S_SUCCESS) {
-            if (virtualContexts.count(context) || contexts.count(context) || releasingContexts.count(context)) {
+            while (releasingContexts.count(context)) contextReleaseChanged.wait(guard);
+            if (virtualContexts.count(context) || contexts.count(context) ||
+                contextIdentities.count(context)) {
                 guard.unlock();
                 osReleaseContext(context);
                 guard.lock();
@@ -426,8 +594,14 @@ API CasLinkEstablishContext(DWORD scope, LPCVOID a, LPCVOID b, LPSCARDCONTEXT re
                 try { extraContexts[context] = extraContext; }
                 catch (...) { extraReleaseContext(extraContext); osReleaseContext(context); throw; }
             }
-            try { contexts.insert(context); }
+            try {
+                contexts.insert(context);
+                if (!contextIdentities.emplace(context, ContextIdentityPtr(new ContextIdentity)).second)
+                    throw std::bad_alloc();
+            }
             catch (...) {
+                contexts.erase(context);
+                contextIdentities.erase(context);
                 auto extra = extraContexts.find(context);
                 if (extra != extraContexts.end()) { extraReleaseContext(extra->second); extraContexts.erase(extra); }
                 osReleaseContext(context);
@@ -448,27 +622,45 @@ API CasLinkReleaseContext(SCARDCONTEXT context) {
         return SCARD_S_SUCCESS;
     }
     if (contexts.count(context)) {
+        const ContextIdentityPtr identity = contextIdentity(context);
+        if (!identity) return SCARD_E_INVALID_HANDLE;
+        while (releasingContexts.count(context) && contextIdentity(context) == identity)
+            contextReleaseChanged.wait(guard);
+        if (!sameContext(context, identity)) return SCARD_E_INVALID_HANDLE;
         try { releasingContexts.insert(context); }
         catch (...) { return SCARD_E_NO_MEMORY; }
-        contexts.erase(context);
+        while (activeStatusChanges.count(context)) {
+            if (!osCancel) {
+                releasingContexts.erase(context);
+                contextReleaseChanged.notify_all();
+                return SCARD_F_INTERNAL_ERROR;
+            }
+            // Repeat cancellation because a counted status call may not have entered winscard yet.
+            guard.unlock();
+            osCancel(context);
+            guard.lock();
+            if (activeStatusChanges.count(context))
+                statusChangeFinished.wait_for(guard, std::chrono::milliseconds(50));
+        }
         guard.unlock();
         LONG rc = osReleaseContext(context);
         guard.lock();
-        releasingContexts.erase(context);
+        SCARDCONTEXT extraContext = 0;
         if (rc == SCARD_S_SUCCESS) {
-            auto extra = extraContexts.find(context);
-            SCARDCONTEXT extraContext = extra == extraContexts.end() ? 0 : extra->second;
-            if (extra != extraContexts.end()) extraContexts.erase(extra);
             contexts.erase(context);
+            auto extra = extraContexts.find(context);
+            extraContext = extra == extraContexts.end() ? 0 : extra->second;
+            if (extra != extraContexts.end()) extraContexts.erase(extra);
             releaseVirtualResources(context);
-            if (extraContext) {
-                guard.unlock();
-                extraReleaseContext(extraContext);
-                guard.lock();
-            }
-        } else {
-            contexts.insert(context);
+            while (activeExtraReaderCalls.count(context)) extraReaderCallChanged.wait(guard);
         }
+        if (extraContext) {
+            guard.unlock();
+            extraReleaseContext(extraContext);
+            guard.lock();
+        }
+        releasingContexts.erase(context);
+        contextReleaseChanged.notify_all();
         return rc;
     }
     return SCARD_E_INVALID_HANDLE;
@@ -483,7 +675,9 @@ API CasLinkFreeMemory(SCARDCONTEXT context, LPCVOID memory) {
         delete[] static_cast<const unsigned char*>(memory);
         allocations.erase(it); return SCARD_S_SUCCESS;
     }
-    return osFreeMemory ? (guard.unlock(), osFreeMemory(context,memory)) : SCARD_E_INVALID_PARAMETER;
+    if (!osFreeMemory) return SCARD_E_INVALID_PARAMETER;
+    guard.unlock();
+    return osFreeMemory(context, memory);
     LEAVE
 }
 API CasLinkListReadersA(SCARDCONTEXT context, LPCSTR groups, char* dst, LPDWORD count) {
@@ -514,7 +708,14 @@ API CasLinkTransmit(SCARDHANDLE handle, LPCSCARD_IO_REQUEST sendPci, LPCBYTE sen
     LPSCARD_IO_REQUEST recvPci, LPBYTE recv, LPDWORD recvLength) {
     ENTER
     auto it = cards.find(handle);
-    if (it == cards.end()) return osTransmit ? (guard.unlock(), osTransmit(handle,sendPci,send,sendLength,recvPci,recv,recvLength)) : SCARD_E_INVALID_HANDLE;
+    if (it == cards.end()) {
+        if (!osTransmit) return SCARD_E_INVALID_HANDLE;
+        if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+        guard.unlock();
+        LONG rc = osTransmit(handle,sendPci,send,sendLength,recvPci,recv,recvLength);
+        guard.lock();
+        return rc;
+    }
     if (!send || !recvLength || !recv || !sendLength || sendLength > 255) return SCARD_E_INVALID_PARAMETER;
     if (recvPci && recvPci->cbPciLength < sizeof(SCARD_IO_REQUEST)) return SCARD_E_INSUFFICIENT_BUFFER;
     std::shared_ptr<Card> card = it->second;
@@ -534,45 +735,136 @@ API CasLinkTransmit(SCARDHANDLE handle, LPCSCARD_IO_REQUEST sendPci, LPCBYTE sen
 }
 API CasLinkDisconnect(SCARDHANDLE handle, DWORD disposition) {
     ENTER
-    auto it = cards.find(handle);
-    if (it != cards.end()) { cards.erase(it); return SCARD_S_SUCCESS; }
-    if (!osDisconnect) return SCARD_E_INVALID_HANDLE;
+    bool localCard = false;
+    LocalCardIdentityPtr requestedIdentity;
+    auto initialIdentity = localCardIdentities.find(handle);
+    if (initialIdentity != localCardIdentities.end()) requestedIdentity = initialIdentity->second;
+    for (;;) {
+        const bool waitedForLocalCard = releasingLocalCards.count(handle) != 0;
+        waitForLocalCardRelease(handle, guard);
+        auto currentIdentity = localCardIdentities.find(handle);
+        if (waitedForLocalCard &&
+            (currentIdentity == localCardIdentities.end() || currentIdentity->second != requestedIdentity))
+            return SCARD_E_INVALID_HANDLE;
+        auto it = cards.find(handle);
+        if (it != cards.end()) { cards.erase(it); return SCARD_S_SUCCESS; }
+        if (!osDisconnect) return SCARD_E_INVALID_HANDLE;
+        localCard = localCards.count(handle) != 0;
+        if (!localCard) break;
+        if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+        if (!localCards.count(handle)) return SCARD_E_INVALID_HANDLE;
+        currentIdentity = localCardIdentities.find(handle);
+        if (currentIdentity == localCardIdentities.end() || currentIdentity->second != requestedIdentity)
+            return SCARD_E_INVALID_HANDLE;
+        if (releasingLocalCards.count(handle)) continue;
+        try { releasingLocalCards.insert(handle); }
+        catch (...) { return SCARD_E_NO_MEMORY; }
+        break;
+    }
     guard.unlock();
     LONG rc = osDisconnect(handle,disposition);
     guard.lock();
-    if (rc == SCARD_S_SUCCESS) localCards.erase(handle);
+    if (localCard) {
+        if (rc == SCARD_S_SUCCESS) {
+            auto currentIdentity = localCardIdentities.find(handle);
+            if (currentIdentity != localCardIdentities.end() && currentIdentity->second == requestedIdentity) {
+                localCards.erase(handle);
+                localCardIdentities.erase(currentIdentity);
+            }
+        }
+        releasingLocalCards.erase(handle);
+        localCardReleaseChanged.notify_all();
+    }
     return rc;
     LEAVE
 }
 API CasLinkBeginTransaction(SCARDHANDLE handle) {
-    ENTER return cards.count(handle) ? SCARD_S_SUCCESS : (osBeginTransaction ? (guard.unlock(), osBeginTransaction(handle)) : SCARD_E_INVALID_HANDLE); LEAVE
+    ENTER
+    if (cards.count(handle)) return SCARD_S_SUCCESS;
+    if (!osBeginTransaction) return SCARD_E_INVALID_HANDLE;
+    if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osBeginTransaction(handle);
+    guard.lock();
+    return rc;
+    LEAVE
 }
 API CasLinkEndTransaction(SCARDHANDLE handle, DWORD disposition) {
-    ENTER return cards.count(handle) ? SCARD_S_SUCCESS : (osEndTransaction ? (guard.unlock(), osEndTransaction(handle,disposition)) : SCARD_E_INVALID_HANDLE); LEAVE
+    ENTER
+    if (cards.count(handle)) return SCARD_S_SUCCESS;
+    if (!osEndTransaction) return SCARD_E_INVALID_HANDLE;
+    if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osEndTransaction(handle,disposition);
+    guard.lock();
+    return rc;
+    LEAVE
 }
 API CasLinkReconnect(SCARDHANDLE handle, DWORD share, DWORD protocols, DWORD initialization, LPDWORD active) {
     ENTER
     if (cards.count(handle)) { if (active) *active = SCARD_PROTOCOL_T1; return SCARD_S_SUCCESS; }
-    return osReconnect ? (guard.unlock(), osReconnect(handle,share,protocols,initialization,active)) : SCARD_E_INVALID_HANDLE;
+    if (!osReconnect) return SCARD_E_INVALID_HANDLE;
+    if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osReconnect(handle,share,protocols,initialization,active);
+    guard.lock();
+    return rc;
     LEAVE
 }
 API CasLinkIsValidContext(SCARDCONTEXT context) {
     ENTER
     if (virtualContexts.count(context)) return SCARD_S_SUCCESS;
     if (!contexts.count(context)) return SCARD_E_INVALID_HANDLE;
-    return osIsValidContext ? (guard.unlock(), osIsValidContext(context)) : SCARD_E_INVALID_HANDLE;
+    if (!osIsValidContext) return SCARD_E_INVALID_HANDLE;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity) return SCARD_E_INVALID_HANDLE;
+    while (releasingContexts.count(context) && contextIdentity(context) == identity)
+        contextReleaseChanged.wait(guard);
+    if (!sameContext(context, identity)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osIsValidContext(context);
+    guard.lock();
+    if (rc != SCARD_S_SUCCESS) return rc;
+    if (!settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
+    return rc;
     LEAVE
 }
 API CasLinkCancel(SCARDCONTEXT context) {
     ENTER
     if (virtualContexts.count(context)) return SCARD_S_SUCCESS;
     if (!contexts.count(context)) return SCARD_E_INVALID_HANDLE;
-    return osCancel ? (guard.unlock(), osCancel(context)) : SCARD_E_INVALID_HANDLE;
+    if (!osCancel) return SCARD_E_INVALID_HANDLE;
+    const ContextIdentityPtr identity = contextIdentity(context);
+    if (!identity) return SCARD_E_INVALID_HANDLE;
+    while (releasingContexts.count(context) && contextIdentity(context) == identity)
+        contextReleaseChanged.wait(guard);
+    if (!sameContext(context, identity)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osCancel(context);
+    guard.lock();
+    if (rc == SCARD_S_SUCCESS && !settledContext(context, identity, guard)) return SCARD_E_INVALID_HANDLE;
+    return rc;
     LEAVE
 }
 API CasLinkGetAttrib(SCARDHANDLE handle, DWORD attr, LPBYTE data, LPDWORD length) {
-    ENTER return cards.count(handle) ? SCARD_E_UNSUPPORTED_FEATURE : (osGetAttrib ? (guard.unlock(), osGetAttrib(handle,attr,data,length)) : SCARD_E_INVALID_HANDLE); LEAVE
+    ENTER
+    if (cards.count(handle)) return SCARD_E_UNSUPPORTED_FEATURE;
+    if (!osGetAttrib) return SCARD_E_INVALID_HANDLE;
+    if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osGetAttrib(handle,attr,data,length);
+    guard.lock();
+    return rc;
+    LEAVE
 }
 API CasLinkControl(SCARDHANDLE handle, DWORD code, LPCVOID input, DWORD inputLength, LPVOID outputBuffer, DWORD outputLength, LPDWORD returned) {
-    ENTER return cards.count(handle) ? SCARD_E_UNSUPPORTED_FEATURE : (osControl ? (guard.unlock(), osControl(handle,code,input,inputLength,outputBuffer,outputLength,returned)) : SCARD_E_INVALID_HANDLE); LEAVE
+    ENTER
+    if (cards.count(handle)) return SCARD_E_UNSUPPORTED_FEATURE;
+    if (!osControl) return SCARD_E_INVALID_HANDLE;
+    if (!waitForLocalCardContext(handle, guard)) return SCARD_E_INVALID_HANDLE;
+    guard.unlock();
+    LONG rc = osControl(handle,code,input,inputLength,outputBuffer,outputLength,returned);
+    guard.lock();
+    return rc;
+    LEAVE
 }
